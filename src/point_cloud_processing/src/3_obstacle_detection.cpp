@@ -15,25 +15,12 @@ using namespace std;
 
 class TerrainNavigator : public rclcpp::Node {
 public:
-    TerrainNavigator() : Node("terrain_navigator") {
-        point_cloud_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            "/camera/camera/depth/color/points", 10,
-            std::bind(&TerrainNavigator::processPointCloud, this, std::placeholders::_1)
-        );
-
-        cmd_vel_pub = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
-        terrain_map_pub = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/terrain_map", 10);
-    }
-
-private:
-    static constexpr float OBSTACLE_HEIGHT_THRESHOLD = 0.2;
-    static constexpr float PIT_DEPTH_THRESHOLD = -0.15;
-    static constexpr float SAFE_DISTANCE = 1.0;
-    static constexpr float CRITICAL_DISTANCE = 0.5;
-
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_sub;
-    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr terrain_map_pub;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub;
+    enum Direction {
+        LEFT,
+        RIGHT,
+        FRONT,
+        BACK
+    };
 
     enum TerrainType {
         SAFE,
@@ -45,8 +32,29 @@ private:
     struct TerrainAnalysis {
         TerrainType type;
         float distance;
-        Eigen::Vector3f direction;
+        Direction obstacleDirection;
+        Eigen::Vector3f directionVector;
     };
+
+    TerrainNavigator() : Node("terrain_navigator") {
+        point_cloud_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+            "/camera/camera/depth/color/points", 10,
+            std::bind(&TerrainNavigator::processPointCloud, this, std::placeholders::_1)
+        );
+
+        cmd_vel_pub = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
+        terrain_map_pub = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/terrain_map", 10);
+    }
+
+private:
+    static constexpr float OBSTACLE_HEIGHT_THRESHOLD = 0.65;
+    static constexpr float PIT_DEPTH_THRESHOLD = -0.15;
+    static constexpr float SAFE_DISTANCE = 2.0;
+    static constexpr float CRITICAL_DISTANCE = 0.5;
+
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_sub;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr terrain_map_pub;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub;
 
     void preprocessPointCloud(pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud) {
         pcl::StatisticalOutlierRemoval<pcl::PointXYZRGB> sor;
@@ -57,36 +65,53 @@ private:
     }
 
     TerrainAnalysis analyzePointCloud(const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud) {
-        TerrainAnalysis result{TerrainType::SAFE, std::numeric_limits<float>::infinity(), Eigen::Vector3f::Zero()};
+        TerrainAnalysis result{TerrainType::SAFE, std::numeric_limits<float>::infinity(), Direction::FRONT, Eigen::Vector3f::Zero()};
+
+        std::vector<std::pair<float, float>> directionSectors = {
+            {-M_PI/4, M_PI/4},     // FRONT
+            {M_PI/4, 3*M_PI/4},    // LEFT
+            {-3*M_PI/4, -M_PI/4},  // RIGHT
+        };
 
         for (const auto& point : cloud->points) {
             float distance = std::sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
+            float angle = std::atan2(point.y, point.x);
 
-            if (std::abs(point.z) > OBSTACLE_HEIGHT_THRESHOLD) {
+            Direction currentDirection = Direction::FRONT;
+            for (size_t i = 0; i < directionSectors.size(); ++i) {
+                if (angle >= directionSectors[i].first && angle < directionSectors[i].second) {
+                    currentDirection = static_cast<Direction>(i);
+                    break;
+                }
+            }
+
+            if (point.z > OBSTACLE_HEIGHT_THRESHOLD && distance < SAFE_DISTANCE) {
                 if (distance < result.distance) {
                     result.type = TerrainType::OBSTACLE;
                     result.distance = distance;
-                    result.direction = Eigen::Vector3f(point.x, point.y, point.z).normalized();
-                    
+                    result.obstacleDirection = currentDirection;
+                    result.directionVector = Eigen::Vector3f(point.x, point.y, point.z).normalized();
+
                     RCLCPP_WARN(this->get_logger(), 
-                        "Obstacle Detected: Distance=%.2f, Z=%.2f", 
-                        distance, point.z
+                        "Obstacle in %s: Distance=%.2f, Height=%.2f", 
+                        getDirectionName(currentDirection).c_str(), distance, point.z
                     );
                 }
             }
 
-            if (point.z < PIT_DEPTH_THRESHOLD) {
+            if (point.z < PIT_DEPTH_THRESHOLD && distance < SAFE_DISTANCE) {
                 if (distance < result.distance) {
                     result.type = TerrainType::PIT;
                     result.distance = distance;
-                    result.direction = Eigen::Vector3f(point.x, point.y, point.z).normalized();
+                    result.obstacleDirection = currentDirection;
+                    result.directionVector = Eigen::Vector3f(point.x, point.y, point.z).normalized();
                 }
             }
         }
 
         if (result.distance < CRITICAL_DISTANCE && result.type != TerrainType::SAFE) {
             result.type = TerrainType::CRITICAL;
-            RCLCPP_ERROR(this->get_logger(), "Critical Distance Reached!");
+            RCLCPP_ERROR(this->get_logger(), "Critical Obstacle in %s!", getDirectionName(result.obstacleDirection).c_str());
         }
 
         return result;
@@ -102,13 +127,43 @@ private:
                 break;
             
             case TerrainType::OBSTACLE:
-                cmd_vel.linear.x = 0.2;
-                cmd_vel.angular.z = terrain.direction.y() > 0 ? -0.5 : 0.5;
+                switch (terrain.obstacleDirection) {
+                    case Direction::FRONT:
+                        cmd_vel.linear.x = 0.1;
+                        cmd_vel.angular.z = terrain.directionVector.y() > 0 ? -0.7 : 0.7;
+                        break;
+                    case Direction::LEFT:
+                        cmd_vel.linear.x = 0.2;
+                        cmd_vel.angular.z = 0.5;
+                        break;
+                    case Direction::RIGHT:
+                        cmd_vel.linear.x = 0.2;
+                        cmd_vel.angular.z = -0.5;
+                        break;
+                    case Direction::BACK:
+                        cmd_vel.linear.x = -0.2;
+                        cmd_vel.angular.z = 0.0;
+                        break;
+                }
                 break;
 
             case TerrainType::PIT:
                 cmd_vel.linear.x = 0.1;
-                cmd_vel.angular.z = terrain.direction.y() > 0 ? 0.5 : -0.5;
+                switch (terrain.obstacleDirection) {
+                    case Direction::LEFT:
+                        cmd_vel.angular.z = 0.5;
+                        break;
+                    case Direction::RIGHT:
+                        cmd_vel.angular.z = -0.5;
+                        break;
+                    case Direction::FRONT:
+                        cmd_vel.angular.z = terrain.directionVector.y() > 0 ? 0.5 : -0.5;
+                        break;
+                    case Direction::BACK:
+                        cmd_vel.linear.x = -0.1;
+                        cmd_vel.angular.z = 0.0;
+                        break;
+                }
                 break;
 
             case TerrainType::CRITICAL:
@@ -118,6 +173,16 @@ private:
         }
 
         return cmd_vel;
+    }
+
+    std::string getDirectionName(Direction dir) {
+        switch (dir) {
+            case Direction::FRONT: return "FRONT";
+            case Direction::LEFT:  return "LEFT";
+            case Direction::RIGHT: return "RIGHT";
+            case Direction::BACK:  return "BACK";
+            default: return "UNKNOWN";
+        }
     }
 
     void processPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
